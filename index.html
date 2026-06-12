@@ -12,6 +12,19 @@
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
 
     <style>
+        #fileProtocolWarning {
+            position: fixed;
+            top: 0; left: 0; right: 0;
+            background: #ff0040;
+            color: white;
+            padding: 14px 20px;
+            text-align: center;
+            z-index: 999;
+            font-weight: bold;
+            font-size: 1rem;
+            display: none;
+        }
+        #fileProtocolWarning a { color: #fff; text-decoration: underline; }
         :root {
             --bg-color: #050510;
             --text-color: #ffffff;
@@ -174,9 +187,29 @@
         .start-btn:hover { transform: scale(1.05); }
 
         .hidden { opacity: 0; pointer-events: none; }
+
+        #videoControls {
+            position: absolute;
+            bottom: 80px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+            display: flex;
+            gap: 10px;
+            background: var(--glass-bg);
+            backdrop-filter: var(--glass-blur);
+            border: 1px solid var(--glass-border);
+            border-radius: 30px;
+            padding: 8px;
+            transition: opacity 0.5s;
+        }
+        #videoControls.hidden { opacity: 0; pointer-events: none; }
+        #loadVideoLabel { cursor: pointer; }
     </style>
 </head>
 <body>
+
+    <div id="fileProtocolWarning"></div>
 
     <!-- Start Overlay (Required for AudioContext initialization) -->
     <div id="startOverlay">
@@ -211,7 +244,25 @@
         <button class="theme-btn" data-theme="Galaxy">Galaxy</button>
     </div>
 
+    <div id="videoControls" class="hidden">
+        <button class="theme-btn" id="loadVideoBtn">Load Video</button>
+        <input type="file" accept="video/*" id="videoFileInput" hidden>
+        <button class="theme-btn" id="playPauseBtn" disabled>Play</button>
+        <button class="theme-btn" id="stopVideoBtn" disabled>Stop</button>
+    </div>
+
 <script>
+// file:// detection — lock WASM won't work without SharedArrayBuffer
+(function() {
+    if (location.protocol === 'file:') {
+        var w = document.getElementById('fileProtocolWarning');
+        w.style.display = 'block';
+        w.innerHTML = 'MediaPipe Hands needs SharedArrayBuffer. '
+            + 'Open via localhost HTTP instead: <a href="http://127.0.0.1:8080/">http://127.0.0.1:8080/</a>'
+            + ' (or run <code>python -m http.server 8080</code> in C:\\HandConnect)';
+    }
+})();
+
 /** 
  * GLOBALS & CONFIG
  */
@@ -263,6 +314,20 @@ const uiFps = document.getElementById('ui-fps');
 const uiGesture = document.getElementById('ui-gesture');
 const uiSpread = document.getElementById('ui-spread');
 
+// Video file mode state
+let handsInstance = null;
+let cameraInstance = null;
+let videoFileMode = false;
+let processingVideo = false;
+let videoFrameRequest = null;
+let mediaPipeFrameInFlight = false;
+let videoFileUrl = null;
+const videoFileInput = document.getElementById('videoFileInput');
+const loadVideoBtn = document.getElementById('loadVideoBtn');
+const playPauseBtn = document.getElementById('playPauseBtn');
+const stopVideoBtn = document.getElementById('stopVideoBtn');
+const videoControls = document.getElementById('videoControls');
+
 /**
  * INITIALIZATION
  */
@@ -281,9 +346,9 @@ window.addEventListener('resize', resize);
 resize();
 
 // UI Theme Switcher
-document.querySelectorAll('.theme-btn').forEach(btn => {
+document.querySelectorAll('#themes .theme-btn').forEach(btn => {
     btn.addEventListener('click', (e) => {
-        document.querySelectorAll('.theme-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('#themes .theme-btn').forEach(b => b.classList.remove('active'));
         e.target.classList.add('active');
         currentTheme = e.target.getAttribute('data-theme');
         document.documentElement.style.setProperty('--accent', themes[currentTheme](0, 1, 1));
@@ -295,6 +360,7 @@ document.getElementById('startBtn').addEventListener('click', () => {
     document.getElementById('startOverlay').classList.add('hidden');
     document.getElementById('hud').classList.remove('hidden');
     document.getElementById('themes').classList.remove('hidden');
+    videoControls.classList.remove('hidden');
     initAudio();
     initMediaPipe();
     requestAnimationFrame(renderLoop);
@@ -446,11 +512,16 @@ function createShockwave(pos, color) {
 
 // Background Effect Engine
 function drawBackground() {
-    // Use destination-out to fade out the previous frame's drops, leaving a transparent trail
-    bgCtx.globalCompositeOperation = 'destination-out';
-    bgCtx.fillStyle = `rgba(0, 0, 0, ${0.15 + Math.min(handVelocities*10, 0.5)})`;
-    bgCtx.fillRect(0, 0, width, height);
-    bgCtx.globalCompositeOperation = 'source-over';
+    if (videoFileMode && videoElement.readyState >= 2) {
+        bgCtx.drawImage(videoElement, 0, 0, width, height);
+        bgCtx.fillStyle = `rgba(0, 0, 0, ${0.15 + Math.min(handVelocities*10, 0.5)})`;
+        bgCtx.fillRect(0, 0, width, height);
+    } else {
+        bgCtx.globalCompositeOperation = 'destination-out';
+        bgCtx.fillStyle = `rgba(0, 0, 0, ${0.15 + Math.min(handVelocities*10, 0.5)})`;
+        bgCtx.fillRect(0, 0, width, height);
+        bgCtx.globalCompositeOperation = 'source-over';
+    }
 
     // Matrix Rain Effect mapping to hand speed
     bgCtx.fillStyle = themes[currentTheme](time, 1, 1);
@@ -671,18 +742,18 @@ function renderLoop(timestamp) {
  * MEDIAPIPE INITIALIZATION
  */
 function initMediaPipe() {
-    const hands = new Hands({locateFile: (file) => {
+    handsInstance = new Hands({locateFile: (file) => {
         return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
     }});
 
-    hands.setOptions({
+    handsInstance.setOptions({
         maxNumHands: 2,
         modelComplexity: 1, 
-        minDetectionConfidence: 0.7,
-        minTrackingConfidence: 0.7
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
     });
 
-    hands.onResults((results) => {
+    handsInstance.onResults((results) => {
         if (!audioCtx) return; // Wait for initialization
 
         // Update global state for render loop to read from
@@ -706,17 +777,160 @@ function initMediaPipe() {
         updateHum(currentHands);
     });
 
-    const camera = new Camera(videoElement, {
-        onFrame: async () => {
-            await hands.send({image: videoElement});
-        },
-        width: 1280,
-        height: 720,
-        facingMode: 'user'
-    });
-    
-    camera.start();
+    startCamera();
 }
+
+function startCamera() {
+    if (cameraInstance) {
+        cameraInstance.stop();
+        cameraInstance = null;
+    }
+    videoFileMode = false;
+    stopVideoProcessing();
+    videoElement.pause();
+    videoElement.removeAttribute('src');
+    videoElement.srcObject = null;
+
+    try {
+        cameraInstance = new Camera(videoElement, {
+            onFrame: async () => {
+                await handsInstance.send({image: videoElement});
+            },
+            width: 1280,
+            height: 720,
+            facingMode: 'user'
+        });
+        cameraInstance.start();
+    } catch (e) {
+        console.warn('Camera unavailable, video mode only:', e.message);
+        cameraInstance = null;
+    }
+    playPauseBtn.disabled = true;
+    stopVideoBtn.disabled = true;
+}
+
+/**
+ * VIDEO FILE HANDLING
+ */
+loadVideoBtn.addEventListener('click', () => {
+    videoFileInput.click();
+});
+
+videoFileInput.addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    loadVideoFile(file);
+});
+
+function stopVideoProcessing() {
+    processingVideo = false;
+    mediaPipeFrameInFlight = false;
+    if (videoFrameRequest !== null) {
+        cancelAnimationFrame(videoFrameRequest);
+        videoFrameRequest = null;
+    }
+}
+
+function startVideoProcessing() {
+    if (!videoFileMode) return;
+    processingVideo = true;
+    if (videoFrameRequest === null) {
+        videoFrameRequest = requestAnimationFrame(processVideoFrames);
+    }
+}
+
+function loadVideoFile(file) {
+    if (cameraInstance) {
+        cameraInstance.stop();
+        cameraInstance = null;
+    }
+    stopVideoProcessing();
+    videoFileMode = true;
+    videoElement.pause();
+    videoElement.removeAttribute('src');
+    videoElement.srcObject = null;
+    videoElement.load();
+
+    if (videoFileUrl) URL.revokeObjectURL(videoFileUrl);
+    videoFileUrl = URL.createObjectURL(file);
+
+    videoElement.src = videoFileUrl;
+    videoElement.loop = false;
+    videoElement.muted = true;
+
+    videoElement.onloadedmetadata = () => {
+        videoElement.play().catch(() => {
+            playPauseBtn.textContent = 'Play';
+        });
+        playPauseBtn.textContent = 'Pause';
+        playPauseBtn.disabled = false;
+        stopVideoBtn.disabled = false;
+        startVideoProcessing();
+    };
+
+    videoElement.onended = () => {
+        playPauseBtn.textContent = 'Replay';
+        stopVideoProcessing();
+    };
+}
+
+async function processVideoFrames() {
+    videoFrameRequest = null;
+
+    if (!processingVideo || !videoFileMode) return;
+
+    if (videoElement.readyState >= 2 && !videoElement.paused && !videoElement.ended && !mediaPipeFrameInFlight) {
+        mediaPipeFrameInFlight = true;
+        try {
+            await handsInstance.send({image: videoElement});
+        } catch (e) {
+            console.error('MediaPipe send error:', e);
+        } finally {
+            mediaPipeFrameInFlight = false;
+        }
+    }
+
+    if (processingVideo && videoFileMode) {
+        videoFrameRequest = requestAnimationFrame(processVideoFrames);
+    }
+}
+
+playPauseBtn.addEventListener('click', () => {
+    if (videoElement.ended) {
+        videoElement.currentTime = 0;
+        videoElement.play().catch(() => {});
+        playPauseBtn.textContent = 'Pause';
+        startVideoProcessing();
+        return;
+    }
+    if (videoElement.paused) {
+        videoElement.play().catch(() => {});
+        playPauseBtn.textContent = 'Pause';
+        startVideoProcessing();
+    } else {
+        videoElement.pause();
+        playPauseBtn.textContent = 'Play';
+        stopVideoProcessing();
+    }
+});
+
+stopVideoBtn.addEventListener('click', () => {
+    stopVideoProcessing();
+    videoFileMode = false;
+    videoElement.pause();
+    videoElement.removeAttribute('src');
+    videoElement.srcObject = null;
+    videoElement.load();
+    if (videoFileUrl) {
+        URL.revokeObjectURL(videoFileUrl);
+        videoFileUrl = null;
+    }
+    playPauseBtn.textContent = 'Play';
+    playPauseBtn.disabled = true;
+    stopVideoBtn.disabled = true;
+    videoFileInput.value = '';
+    startCamera();
+});
 
 </script>
 </body>
